@@ -1053,7 +1053,56 @@ def apply_polygonal_mask(img: Image.Image, polygon: np.ndarray, cval=0) -> Image
     out.paste(img, mask=mask)
     return out
 
-def extract_polygons(im: Image.Image, bounds: Dict[str, Any]) -> Image.Image:
+def _fast_legacy_warp(im: Image.Image, tform: PiecewiseAffineTransform, output_shape: Tuple[int, int], order:int=0) -> Image.Image:
+    """
+    Applies a piecewise affine transform to an image.
+
+    Args:
+        im: Input image
+        tform: A piecewise affine transform
+        output_shape: The shape of the output image
+        order: Interpolation order
+
+    Returns:
+        The warped image
+    """
+    resample = {0: Image.NEAREST, 1: Image.BILINEAR, 2: Image.BICUBIC, 3: Image.BICUBIC}.get(order, Image.NEAREST)
+
+    tesselation = tform._inverse_tesselation
+    affines = tform.inverse_affines
+
+    output_image = Image.new(im.mode, (output_shape[1], output_shape[0]), 0)
+
+    for (simplex, affine) in zip(tesselation.simplices, affines):
+        if affine is None:
+            continue
+        dst_coords = tesselation.points[simplex]
+        src_coords = affine(dst_coords)
+        # calculate source bounding box
+        c_min, c_max = int(src_coords[:, 0].min()-2), int(src_coords[:, 0].max()+2)
+        r_min, r_max = int(src_coords[:, 1].min()-2), int(src_coords[:, 1].max()+2)
+        # calculate destination bounding box
+        c_dst_min, c_dst_max = int(dst_coords[:, 0].min()-2), int(dst_coords[:, 0].max()+2)
+        r_dst_min, r_dst_max = int(dst_coords[:, 1].min()-2), int(dst_coords[:, 1].max()+2)
+        # crop out bounding box
+        offset_src_coords = src_coords - (c_min, r_min)
+        offset_dst_coords = dst_coords - (c_dst_min, r_dst_min)
+        patch = im.crop((c_min, r_min, c_max+1, r_max+1))
+        # adapt affine transform to cropped patch
+        delta = offset_src_coords[0] - affine.params[:2, :2].dot(offset_dst_coords[0])
+        pdata = affine.params.flatten().tolist()[:6]
+        pdata[2] = delta[0]
+        pdata[5] = delta[1]
+        # warp
+        patch = patch.transform((c_dst_max - c_dst_min + 1, r_dst_max - r_dst_min + 1), Image.AFFINE, data=pdata, resample=resample)
+        # calculate mask
+        mask = make_polygonal_mask(offset_dst_coords, patch.size)
+        # paste
+        output_image.paste(patch, box=(c_dst_min, r_dst_min), mask=mask)
+
+    return output_image
+
+def extract_polygons(im: Image.Image, bounds: Dict[str, Any], legacy_warp:bool=False) -> Image.Image:
     """
     Yields the subimages of image im defined in the list of bounding polygons
     with baselines preserving order.
@@ -1159,22 +1208,35 @@ def extract_polygons(im: Image.Image, bounds: Dict[str, Any]) -> Image.Image:
                 offset_baseline = baseline - (c_min, r_min)
                 # offset dst point by dst polygon shape
                 offset_bl_dst_pts = bl_dst_pts - (c_dst_min, r_dst_min)
+                offset_pol_dst_pts = pol_dst_pts - (c_dst_min, r_dst_min)
                 # mask out points outside bounding polygon
                 patch = apply_polygonal_mask(patch, offset_polygon, cval=0)
 
-                # estimate piecewise transform by beveling angles
-                source_envelope, target_envelope = _beveled_warping_envelope(offset_baseline, offset_bl_dst_pts[0], output_shape)
-                # mesh for PIL, as (box, quad) tuples : box is (NW, SE) and quad is (NW, SW, SE, NE)
-                deform_mesh = [
-                    (
-                        (*target_envelope[i], *target_envelope[i+3]),
-                        (*source_envelope[i], *source_envelope[i+1], *source_envelope[i+3], *source_envelope[i+2])
-                    )
-                    for i in range(0, len(source_envelope)-3, 2)
-                ]
-                # warp
-                resample = {0: Image.NEAREST, 1: Image.BILINEAR, 2: Image.BICUBIC, 3: Image.BICUBIC}.get(order, Image.NEAREST)
-                i = patch.transform((output_shape[1], output_shape[0]), Image.MESH, data=deform_mesh, resample=resample)
+                if not legacy_warp:
+                    # estimate piecewise transform by beveling angles
+                    source_envelope, target_envelope = _beveled_warping_envelope(offset_baseline, offset_bl_dst_pts[0], output_shape)
+                    # mesh for PIL, as (box, quad) tuples : box is (NW, SE) and quad is (NW, SW, SE, NE)
+                    deform_mesh = [
+                        (
+                            (*target_envelope[i], *target_envelope[i+3]),
+                            (*source_envelope[i], *source_envelope[i+1], *source_envelope[i+3], *source_envelope[i+2])
+                        )
+                        for i in range(0, len(source_envelope)-3, 2)
+                    ]
+                    # warp
+                    resample = {0: Image.NEAREST, 1: Image.BILINEAR, 2: Image.BICUBIC, 3: Image.BICUBIC}.get(order, Image.NEAREST)
+                    i = patch.transform((output_shape[1], output_shape[0]), Image.MESH, data=deform_mesh, resample=resample)
+                else:
+                    offset_pol_dst_pts = pol_dst_pts - (c_dst_min, r_dst_min)
+
+                    src_points = np.concatenate((offset_baseline, offset_polygon))
+                    dst_points = np.concatenate((offset_bl_dst_pts, offset_pol_dst_pts))
+
+                    tform = PiecewiseAffineTransform()
+                    tform.estimate(src_points, dst_points)
+
+                    i = _fast_legacy_warp(patch, tform, output_shape, order=order)
+
             yield i.crop(i.getbbox()), line
     else:
         if bounds['text_direction'].startswith('vertical'):
