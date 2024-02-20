@@ -36,7 +36,7 @@ from skimage.graph import MCP_Connect
 from skimage.filters import apply_hysteresis_threshold, sobel
 from skimage.measure import approximate_polygon, subdivide_polygon, regionprops, label
 from skimage.morphology import skeletonize
-from skimage.transform import PiecewiseAffineTransform, SimilarityTransform, AffineTransform
+from skimage.transform import PiecewiseAffineTransform, SimilarityTransform, AffineTransform, warp
 
 from typing import List, Tuple, Union, Dict, Any, Sequence, Optional, TypeVar
 
@@ -46,6 +46,7 @@ from kraken.lib.exceptions import KrakenInputException
 from scipy.signal import convolve2d
 from scipy.ndimage import gaussian_filter
 
+POLYGON_SETTINGS = {"warp": "legacy", "mask": "legacy", "poly": "legacy"}
 
 logger = logging.getLogger('kraken')
 
@@ -1039,8 +1040,14 @@ def make_polygonal_mask(polygon: np.ndarray, shape: Tuple[int, int]) -> Image.Im
     Returns:
         A PIL.Image.Image instance containing the mask.
     """
-    mask = Image.new('L', shape, 0)
-    ImageDraw.Draw(mask).polygon([tuple(p) for p in polygon.astype(int).tolist()], fill=255, width=2)
+    if POLYGON_SETTINGS["mask"] == "legacy":
+        r, c = draw.polygon(polygon[:, 1], polygon[:, 0])
+        mask = np.zeros(shape[::-1], dtype=bool)
+        mask[r, c] = True
+        mask = Image.fromarray(mask.astype(np.uint8)*255)
+    else:
+        mask = Image.new('L', shape, 0)
+        ImageDraw.Draw(mask).polygon([tuple(p) for p in polygon.astype(int).tolist()], fill=255, width=2)
     return mask
 
 
@@ -1102,7 +1109,7 @@ def _fast_legacy_warp(im: Image.Image, tform: PiecewiseAffineTransform, output_s
 
     return output_image
 
-def extract_polygons(im: Image.Image, bounds: Dict[str, Any], legacy_warp:bool=False) -> Image.Image:
+def extract_polygons(im: Image.Image, bounds: Dict[str, Any]) -> Image.Image:
     """
     Yields the subimages of image im defined in the list of bounding polygons
     with baselines preserving order.
@@ -1167,36 +1174,66 @@ def extract_polygons(im: Image.Image, bounds: Dict[str, Any], legacy_warp:bool=F
                     pl = approximate_polygon(pl, 2)
                 full_polygon = subdivide_polygon(pl, preserve_ends=True)
 
-                # baseline segment vectors
-                diff_bl = np.diff(baseline, axis=0)
-                diff_bl_norms = np.linalg.norm(diff_bl, axis=1)
-                diff_bl_normed = diff_bl / diff_bl_norms[:, None]
+                if POLYGON_SETTINGS["poly"] == "legacy":
+                    pl = geom.MultiPoint(full_polygon)
 
-                l_poly = len(full_polygon)
-                cum_lens = np.cumsum([0] + np.linalg.norm(diff_bl, axis=1).tolist())
+                    bl = zip(baseline[:-1:], baseline[1::])
+                    bl = [geom.LineString(x) for x in bl]
+                    cum_lens = np.cumsum([0] + [line.length for line in bl])
+                    # distance of intercept from start point and number of line segment
+                    control_pts = []
+                    for point in pl.geoms:
+                        npoint = np.array(point.coords)[0]
+                        line_idx, dist, intercept = min(((idx, line.project(point),
+                                                        np.array(line.interpolate(line.project(point)).coords)) for idx, line in enumerate(bl)),
+                                                        key=lambda x: np.linalg.norm(npoint-x[2]))
+                        # absolute distance from start of line
+                        line_dist = cum_lens[line_idx] + dist
+                        intercept = np.array(intercept)
+                        # side of line the point is at
+                        side = np.linalg.det(np.array([[baseline[line_idx+1][0]-baseline[line_idx][0],
+                                                        npoint[0]-baseline[line_idx][0]],
+                                                    [baseline[line_idx+1][1]-baseline[line_idx][1],
+                                                        npoint[1]-baseline[line_idx][1]]]))
+                        side = np.sign(side)
+                        # signed perpendicular distance from the rectified distance
+                        per_dist = side * np.linalg.norm(npoint-intercept)
+                        control_pts.append((line_dist, per_dist))
+                    # calculate baseline destination points
+                    bl_dst_pts = baseline[0] + np.dstack((cum_lens, np.zeros_like(cum_lens)))[0]
+                    # calculate bounding polygon destination points
+                    pol_dst_pts = np.array([baseline[0] + (line_dist, per_dist) for line_dist, per_dist in control_pts])
+                else:
+                    # baseline segment vectors
+                    diff_bl = np.diff(baseline, axis=0)
+                    diff_bl_norms = np.linalg.norm(diff_bl, axis=1)
+                    diff_bl_normed = diff_bl / diff_bl_norms[:, None]
 
-                # calculate baseline destination points :
-                bl_dst_pts = baseline[0] + np.dstack((cum_lens, np.zeros_like(cum_lens)))[0]
+                    l_poly = len(full_polygon)
+                    cum_lens = np.cumsum([0] + np.linalg.norm(diff_bl, axis=1).tolist())
 
-                # calculate bounding polygon destination points :
-                # difference between baselines and polygon
-                # diff[k, p] = baseline[k] - polygon[p]
-                poly_bl_diff = full_polygon[None, :] - baseline[:-1, None]
-                # local x coordinates of polygon points on baseline segments
-                # x[k, p] = (baseline[k] - polygon[p]) . (baseline[k+1] - baseline[k]) / |baseline[k+1] - baseline[k]|
-                poly_bl_x = np.einsum('kpm,km->kp', poly_bl_diff, diff_bl_normed)
-                # distance to baseline segments
-                poly_bl_segdist = np.maximum(-poly_bl_x, poly_bl_x - diff_bl_norms[:, None])
-                # closest baseline segment index
-                poly_closest_bl = np.argmin((poly_bl_segdist), axis=0)
-                poly_bl_x = poly_bl_x[poly_closest_bl, np.arange(l_poly)]
-                poly_bl_diff = poly_bl_diff[poly_closest_bl, np.arange(l_poly)]
-                # signed distance between polygon points and baseline segments (to get y coordinates)
-                poly_bl_y = np.cross(diff_bl_normed[poly_closest_bl], poly_bl_diff)
-                # final destination points
-                pol_dst_pts = np.array(
-                    [cum_lens[poly_closest_bl] + poly_bl_x, poly_bl_y]
-                ).T + baseline[:1]
+                    # calculate baseline destination points :
+                    bl_dst_pts = baseline[0] + np.dstack((cum_lens, np.zeros_like(cum_lens)))[0]
+
+                    # calculate bounding polygon destination points :
+                    # difference between baselines and polygon
+                    # diff[k, p] = baseline[k] - polygon[p]
+                    poly_bl_diff = full_polygon[None, :] - baseline[:-1, None]
+                    # local x coordinates of polygon points on baseline segments
+                    # x[k, p] = (baseline[k] - polygon[p]) . (baseline[k+1] - baseline[k]) / |baseline[k+1] - baseline[k]|
+                    poly_bl_x = np.einsum('kpm,km->kp', poly_bl_diff, diff_bl_normed)
+                    # distance to baseline segments
+                    poly_bl_segdist = np.maximum(-poly_bl_x, poly_bl_x - diff_bl_norms[:, None])
+                    # closest baseline segment index
+                    poly_closest_bl = np.argmin((poly_bl_segdist), axis=0)
+                    poly_bl_x = poly_bl_x[poly_closest_bl, np.arange(l_poly)]
+                    poly_bl_diff = poly_bl_diff[poly_closest_bl, np.arange(l_poly)]
+                    # signed distance between polygon points and baseline segments (to get y coordinates)
+                    poly_bl_y = np.cross(diff_bl_normed[poly_closest_bl], poly_bl_diff)
+                    # final destination points
+                    pol_dst_pts = np.array(
+                        [cum_lens[poly_closest_bl] + poly_bl_x, poly_bl_y]
+                    ).T + baseline[:1]
 
                 # extract bounding box patch
                 c_dst_min, c_dst_max = int(pol_dst_pts[:, 0].min()), int(pol_dst_pts[:, 0].max())
@@ -1212,7 +1249,7 @@ def extract_polygons(im: Image.Image, bounds: Dict[str, Any], legacy_warp:bool=F
                 # mask out points outside bounding polygon
                 patch = apply_polygonal_mask(patch, offset_polygon, cval=0)
 
-                if not legacy_warp:
+                if POLYGON_SETTINGS['warp'] == "new":
                     # estimate piecewise transform by beveling angles
                     source_envelope, target_envelope = _beveled_warping_envelope(offset_baseline, offset_bl_dst_pts[0], output_shape)
                     # mesh for PIL, as (box, quad) tuples : box is (NW, SE) and quad is (NW, SW, SE, NE)
@@ -1235,7 +1272,11 @@ def extract_polygons(im: Image.Image, bounds: Dict[str, Any], legacy_warp:bool=F
                     tform = PiecewiseAffineTransform()
                     tform.estimate(src_points, dst_points)
 
-                    i = _fast_legacy_warp(patch, tform, output_shape, order=order)
+                    if POLYGON_SETTINGS['warp'] == "fast_legacy":
+                        i = _fast_legacy_warp(patch, tform, output_shape, order=order)
+                    else:
+                        o = warp(np.array(patch), tform.inverse, output_shape=output_shape, preserve_range=True, order=order)
+                        i = Image.fromarray(o.astype('uint8'))
 
             yield i.crop(i.getbbox()), line
     else:
